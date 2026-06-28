@@ -393,6 +393,8 @@ __all__ = [
     "TiledMma",
     "Stream",
     "Tuple3D",
+    "Basis",
+    "E",
     # Vector types
     "Vector",
     "ReductionOp",
@@ -465,7 +467,7 @@ class Constexpr:
 
     @staticmethod
     def _is_supported_annotation(param) -> bool:
-        return param in (int, bool, float) or Constexpr._is_tuple_annotation(param)
+        return param in (int, bool, float, str) or Constexpr._is_tuple_annotation(param)
 
     @staticmethod
     def _scalar_cache_signature(value):
@@ -475,6 +477,8 @@ class Constexpr:
             return (int, value)
         if type(value) is float:
             return (float, value)
+        if type(value) is str:
+            return (str, value)
         return None
 
     @staticmethod
@@ -526,7 +530,7 @@ class Constexpr:
         if lambda_sig is not None:
             return lambda_sig
         raise TypeError(
-            "Constexpr values support only int, bool, float, tuples of those scalar values, "
+            "Constexpr values support only int, bool, float, str, tuples of those scalar values, "
             "and lambdas without free variables"
         )
 
@@ -535,7 +539,7 @@ class Constexpr:
             raise TypeError(f"{cls.__name__} cannot be re-parametrized")
         if not Constexpr._is_supported_annotation(param) and not Constexpr._is_callable_annotation(param):
             raise TypeError(
-                "Constexpr[...] supports only int, bool, float, tuple, or Callable annotations; " f"got {param!r}"
+                "Constexpr[...] supports only int, bool, float, str, tuple, or Callable annotations; " f"got {param!r}"
             )
         cached = Constexpr._annotation_cache.get(param)
         if cached is not None:
@@ -608,7 +612,7 @@ class Constexpr:
                 if not isinstance(value, tuple):
                     raise TypeError(f"expects tuple, got {type(value).__name__}")
                 Constexpr.value_signature(value)
-            elif inner in (int, bool, float):
+            elif inner in (int, bool, float, str):
                 if type(value) is not inner:
                     raise TypeError(f"expects {inner.__name__}, got {type(value).__name__}")
                 Constexpr.value_signature(value)
@@ -675,15 +679,29 @@ class IntTuple(BuiltinDslType):
         return self.type.get_static_leaf_int
 
     @staticmethod
+    def _static_leaf_to_py(ty):
+        if ty.is_leaf_basis:
+            bt = ty.get_leaf_as_basis
+            return Basis(bt.value, list(bt.modes))
+        return ty.get_static_leaf_int
+
+    @staticmethod
+    def _dynamic_leaf_to_py(ty, value):
+        value = as_dsl_value(value)
+        if ty.is_leaf_basis:
+            return Basis(value, list(ty.get_leaf_as_basis.modes))
+        return value
+
+    @staticmethod
     def _static_to_py_value(ty):
         if ty.is_leaf:
-            return ty.get_static_leaf_int
+            return IntTuple._static_leaf_to_py(ty)
         return tuple(IntTuple._static_to_py_value(ty.at(i)) for i in range(ty.rank))
 
     def _rebuild_py_value(self, leaf_iter):
         if self.is_leaf:
             if self.is_static:
-                return self.get_static_leaf_int
+                return IntTuple._static_leaf_to_py(self.type)
             return next(leaf_iter)
         return tuple(get_(self, i)._rebuild_py_value(leaf_iter) for i in range(self.rank))
 
@@ -1247,6 +1265,61 @@ class Tuple3D:
 
     def __iter__(self):
         return iter((self.x, self.y, self.z))
+
+
+class Basis:
+    def __init__(self, value, modes):
+        if isinstance(value, Basis):
+            value = value.value
+        if isinstance(modes, int):
+            modes = [modes]
+        modes = list(modes)
+        if not modes:
+            raise ValueError("Basis requires at least one mode")
+        if any(isinstance(m, bool) or not isinstance(m, int) or m < 0 for m in modes):
+            raise ValueError(f"Basis modes must be non-negative ints, got {modes!r}")
+
+        self.value = value
+        self.modes = modes
+
+    def __mul__(self, other):
+        if not isinstance(other, (int, Integer)):
+            raise TypeError(f"Basis multiplication requires int or Integer, got {type(other)}")
+        return Basis(self.value * other, self.modes)
+
+    __rmul__ = __mul__
+
+    def __eq__(self, other):
+        if not isinstance(other, Basis):
+            return False
+        if self.modes != other.modes:
+            return False
+        return self.value == other.value
+
+    def __hash__(self):
+        return hash((self.value, tuple(self.modes)))
+
+    def __repr__(self):
+        return f"{self.value}" + "".join(f"E{m}" for m in self.modes)
+
+
+def E(*mode):
+    """Build a unit basis stride leaf ``E<modes>`` (scale=1).
+
+    Examples:
+        E()         -> 1       # fall back to scalar
+        E(0)        -> 1E0
+        E(0, 1)     -> 1E0E1
+        E([0, 1])   -> 1E0E1
+    """
+
+    if len(mode) == 1 and isinstance(mode[0], (list, tuple)):
+        mode = tuple(mode[0])
+    if not mode:
+        return 1
+    if any(isinstance(m, bool) or not isinstance(m, int) or m < 0 for m in mode):
+        raise TypeError(f"E modes must be non-negative ints, got {mode!r}")
+    return Basis(1, list(mode))
 
 
 # ═══════════════════════════════════════════════════════════════════════

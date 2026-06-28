@@ -7,11 +7,13 @@ from functools import wraps
 from typing import overload
 
 from .._mlir import ir
+from .._mlir._mlir_libs._mlirDialectsFly import _Basis
 from .._mlir.dialects import arith as _arith
 from .._mlir.dialects import fly
 from .._mlir.dialects.fly import (
     AddressSpace,
     AtomicOp,
+    BasisType,
     CachePolicy,
     ComposedLayoutType,
     CoordSwizzleType,
@@ -35,6 +37,7 @@ from .._mlir.dialects.fly import (
     has_none,
 )
 from .._mlir.extras import types as T
+from .enum import SyncScope
 from .meta import dsl_loc_tracing, dsl_wrap_result
 
 __all__ = [
@@ -49,6 +52,7 @@ __all__ = [
     "GemmTraversalOrder",
     # Types
     "IntTupleType",
+    "BasisType",
     "TileType",
     "LayoutType",
     "SwizzleType",
@@ -197,14 +201,24 @@ UniversalCopy32b = lambda: CopyOpUniversalCopyType.get(32)
 UniversalCopy64b = lambda: CopyOpUniversalCopyType.get(64)
 UniversalCopy128b = lambda: CopyOpUniversalCopyType.get(128)
 
-UniversalAtomic = lambda atomic_op, val_type: CopyOpUniversalAtomicType.get(int(atomic_op), val_type.ir_type)
-UniversalAtomicAdd = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.Add), val_type.ir_type)
-UniversalAtomicMax = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.Max), val_type.ir_type)
-UniversalAtomicMin = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.Min), val_type.ir_type)
-UniversalAtomicAnd = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.And), val_type.ir_type)
-UniversalAtomicOr = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.Or), val_type.ir_type)
-UniversalAtomicInc = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.Inc), val_type.ir_type)
-UniversalAtomicDec = lambda val_type: CopyOpUniversalAtomicType.get(int(AtomicOp.Dec), val_type.ir_type)
+
+def UniversalAtomic(atomic_op, val_type, syncscope=SyncScope.System):
+    """Create a target-neutral atomic copy atom.
+
+    ``syncscope`` is the LLVM atomicrmw sync scope string. It defaults to
+    ``SyncScope.System``, i.e. the system scope.  Use ``fx.SyncScope`` /
+    ``fx.rocdl.SyncScope`` for the target-specific values.
+    """
+    return CopyOpUniversalAtomicType.get(int(atomic_op), val_type.ir_type, syncscope)
+
+
+UniversalAtomicAdd = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.Add, val_type, syncscope)
+UniversalAtomicMax = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.Max, val_type, syncscope)
+UniversalAtomicMin = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.Min, val_type, syncscope)
+UniversalAtomicAnd = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.And, val_type, syncscope)
+UniversalAtomicOr = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.Or, val_type, syncscope)
+UniversalAtomicInc = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.Inc, val_type, syncscope)
+UniversalAtomicDec = lambda val_type, syncscope=SyncScope.System: UniversalAtomic(AtomicOp.Dec, val_type, syncscope)
 
 UniversalFMA = lambda ty: MmaOpUniversalFMAType.get(ty.ir_type)
 
@@ -220,11 +234,10 @@ def _is_int_tuple_value(value):
 
 def _expand_int_tuple_leaves(value):
     from .numeric import Int32, Int64, Numeric
+    from .typing import Basis
 
     if _is_int_tuple_value(value):
         return _expand_int_tuple_leaves(value.to_py_value())
-    if isinstance(value, (list, tuple)):
-        return tuple(_expand_int_tuple_leaves(v) for v in value)
     # widen narrow dynamic ints to i32
     if isinstance(value, Numeric):
         if isinstance(value.value, ir.Value) and type(value).width < 32:
@@ -234,6 +247,10 @@ def _expand_int_tuple_leaves(value):
         return Int32(value).value
     if isinstance(value, ir.Value) and isinstance(value.type, ir.IndexType):
         return Int64(value).value
+    if isinstance(value, Basis):
+        return _Basis(_expand_int_tuple_leaves(value.value), value.modes)
+    if isinstance(value, (list, tuple)):
+        return tuple(_expand_int_tuple_leaves(v) for v in value)
     return value
 
 
@@ -538,11 +555,14 @@ def get_scalar(int_tuple):
         get_scalar(make_coord(tid)) -> Int32(tid)
         get_scalar(make_int_tuple(5)) -> 5
     """
+    from .typing import IntTuple
+
     if not _is_int_tuple_value(int_tuple):
         return int_tuple
-    if int_tuple.is_leaf and int_tuple.is_static:
-        return int_tuple.get_static_leaf_int
-    return fly.get_scalar(int_tuple)
+    leaf_ty = int_tuple.type
+    if leaf_ty.is_leaf and leaf_ty.is_static:
+        return IntTuple._static_leaf_to_py(leaf_ty)
+    return IntTuple._dynamic_leaf_to_py(leaf_ty, fly.get_scalar(int_tuple))
 
 
 @dsl_loc_tracing
@@ -557,9 +577,7 @@ def get_leaves(input, dynamic_only=False):
         get_leaves(make_coord(tid, 0)) -> (Int32(tid), 0)
         get_leaves(make_coord(tid, 0), dynamic_only=True) -> (Int32(tid),) # 0 is static, dropped
     """
-    if dynamic_only:
-        res_lists = fly.GetLeavesOp(input, dynamicOnly=True)
-        return tuple(res_lists.results)
+    from .typing import IntTuple
 
     def _walk_int_tuple_leaves(ty):
         if ty.is_leaf:
@@ -574,9 +592,10 @@ def get_leaves(input, dynamic_only=False):
     out = []
     for leaf_ty in _walk_int_tuple_leaves(ty):
         if leaf_ty.is_static:
-            out.append(leaf_ty.get_static_leaf_int)
+            if not dynamic_only:
+                out.append(IntTuple._static_leaf_to_py(leaf_ty))
         else:
-            out.append(next(dyn_iter))
+            out.append(IntTuple._dynamic_leaf_to_py(leaf_ty, next(dyn_iter)))
     return tuple(out)
 
 
@@ -711,7 +730,7 @@ def get(int_tuple, mode):
 
 
 @dsl_loc_tracing
-@coerce_int_tuple_args("int_tuple")
+@coerce_int_tuple_args("int_tuple", permissive=True)
 def get_(int_tuple, mode):
     if isinstance(mode, int):
         mode = [mode]
@@ -719,19 +738,19 @@ def get_(int_tuple, mode):
 
 
 @dsl_loc_tracing
-@coerce_int_tuple_args("int_tuple")
+@coerce_int_tuple_args("int_tuple", permissive=True)
 def take(int_tuple, begin: int, end: int):
     return fly.take(int_tuple, begin=begin, end=end)
 
 
 @dsl_loc_tracing
-@coerce_int_tuple_args("int_tuple")
+@coerce_int_tuple_args("int_tuple", permissive=True)
 def select(int_tuple, indices):
     return fly.select(int_tuple, indices=indices)
 
 
 @dsl_loc_tracing
-@coerce_int_tuple_args("int_tuple")
+@coerce_int_tuple_args("int_tuple", permissive=True)
 def group(int_tuple, begin: int, end: int):
     return fly.group(int_tuple, begin=begin, end=end)
 
