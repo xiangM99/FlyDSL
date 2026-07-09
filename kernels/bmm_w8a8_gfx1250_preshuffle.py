@@ -59,7 +59,7 @@ LDS_SEGMENT_BYTES = 64 * 1024
 LDS_GFX1250_MAX_BYTES = 5 * LDS_SEGMENT_BYTES
 
 @functools.lru_cache(maxsize=256)
-def compile_bmm_w8a8_gfx1250(
+def compile_bmm_w8a8_preshuffle_gfx1250(
     *,
     B: int = 16,
     M: int = 0,
@@ -133,12 +133,6 @@ def compile_bmm_w8a8_gfx1250(
             f"got {num_k_tiles} (K={K}, tile_k={tile_k})"
         )
 
-    # ── Multi-stage pipeline schedule (compile-time) ──
-    pre_loaded = num_buffers - 1
-    loop_iters = (num_k_tiles - pre_loaded) // num_buffers
-    _tail_start = loop_iters * num_buffers
-    extra = num_k_tiles - _tail_start - pre_loaded
-    tail_plan = make_tail_plan(num_buffers, pre_loaded, extra)
 
     gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
@@ -157,12 +151,33 @@ def compile_bmm_w8a8_gfx1250(
     lds_a_stride_bytes = lds_a_stride
     lds_a_bytes  = tile_m * lds_a_stride
     
-    #先不pershuffle
-    lds_b_stride = tile_k + LDS_PAD_A_BYTES
+    lds_b_stride = tile_k
     lds_b_stride_bytes = lds_b_stride
     lds_b_bytes  = tile_n * lds_b_stride
 
-    tdm_desc_num_warps = 1 if wave_specialized_tdm else num_warps
+    tdm_desc_num_warps = 2 if wave_specialized_tdm else num_warps
+
+    #####################################################
+    def _align_up(value: int, align: int) -> int:
+        if value % align == 0:
+            return value
+        return (value + align - 1) // align * align
+    stage_layout = SmemAllocator(None, arch=gpu_arch, global_sym_name=f"bmm_fp8_layout")
+    stage_a_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
+    stage_layout.ptr = stage_a_data_rel_off + lds_a_bytes
+    stage_b_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
+    stage_layout.ptr = stage_b_data_rel_off + lds_b_bytes
+    stage_bytes = _align_up(stage_layout.ptr, 128)
+
+    # ── Multi-stage pipeline schedule (compile-time) ──
+    pre_loaded = num_buffers - 1
+    loop_iters = (num_k_tiles - pre_loaded) // num_buffers
+    _tail_start = loop_iters * num_buffers
+    extra = num_k_tiles - _tail_start - pre_loaded
+    tail_plan = make_tail_plan(num_buffers, pre_loaded, extra)
+
+    _last_compute_stage = tail_plan[-1][1]
+    stage_pitch_bytes = _align_up(stage_bytes, 1024)
 
     #####################################################
     arena_alloc = SmemAllocator(
@@ -172,14 +187,47 @@ def compile_bmm_w8a8_gfx1250(
             f"bmm_w8a8_{tile_m}x{tile_n}x{tile_k}"
         ),
     )
-
-    stage_a_data_off = [0x00000, 0x04800, 0x09000, 0x0D800]
-    stage_b_data_off = [0x20000, 0x29000, 0x32000, 0x3B000]
-
-    arena_alloc.ptr = LDS_GFX1250_MAX_BYTES
+    #######################################################
+    stage_phys_order = [i for i in range(num_buffers) if i != _last_compute_stage]
+    stage_phys_order.append(_last_compute_stage)
+    stage_base_off = [0] * num_buffers
+    for phys_i, logical_i in enumerate(stage_phys_order):
+        stage_base_off[logical_i] = phys_i * stage_pitch_bytes
+    arena_alloc.ptr = stage_pitch_bytes * num_buffers
     arena_total_bytes = arena_alloc.ptr
-    epilogue_fence_threshold_bytes = 0
+    
+    epilogue_fence_threshold_bytes = tdm_epilogue_fence_threshold_bytes(
+        stage_base_off=stage_base_off,
+        tail_plan=tail_plan,
+        loop_iters=loop_iters,
+        extra=extra,
+    )
+    stage_a_data_off = [stage_base_off[i] + stage_a_data_rel_off for i in range(num_buffers)]
+    stage_b_data_off = [stage_base_off[i] + stage_b_data_rel_off for i in range(num_buffers)]
 
+    scale_a_lds_bytes = tile_m * k_k_blocks
+    scale_a_lds_off = _align_up(arena_total_bytes, 16)
+    arena_alloc.ptr = scale_a_lds_off + scale_a_lds_bytes
+    arena_total_bytes = arena_alloc.ptr
+
+    use_deep_pipeline = (
+        tile_m == 128
+        and tile_n == 256
+        and tile_k == 128
+        and num_buffers == 4
+    )
+    if const_expr(use_deep_pipeline):
+
+        stage_a_data_off = [0x00000, 0x04800, 0x09000, 0x0D800]
+        stage_b_data_off = [0x20000, 0x28000, 0x30000, 0x38000]
+        scale_a_lds_off = 0x12000
+
+        arena_alloc.ptr = LDS_GFX1250_MAX_BYTES
+        arena_total_bytes = arena_alloc.ptr
+        epilogue_fence_threshold_bytes = 0
+
+        
+    #########################################################
     if const_expr(use_tdm_store):
         lds_d_row_stride = warp_tile_n * elem_bytes_d + LDS_PAD_D_BYTES
         warp_d_bytes = warp_tile_m * lds_d_row_stride
@@ -193,12 +241,15 @@ def compile_bmm_w8a8_gfx1250(
             arena_total_bytes = total_d_bytes
             arena_alloc.ptr = total_d_bytes
     check_smem_capacity(arena_total_bytes, gpu_arch)
-
+    #############################################################
     if const_expr(wave_specialized_tdm):
         TDM_LOADS_PER_STEP = 1
     else:
         TDM_LOADS_PER_STEP = 2
-    
+
+    tail_plan = [(ls, cs, o * TDM_LOADS_PER_STEP // 2 if o > 0 else o) for ls, cs, o in tail_plan]
+
+
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def kernel_bmm_w8a8_gfx1250(
@@ -296,19 +347,22 @@ def compile_bmm_w8a8_gfx1250(
                 workgroup_mask=a_mcast_mask,
                 atomic_barrier_enable=atomic_barrier_enable,
                 early_timeout=True,
+                
             )
         
         def make_desc_b(memref, k_base):
             return _make_tdm_desc(
                 global_ptr=arg_b,
                 lds_memref=memref,
-                global_offset=(blk_n + b_batch_off, k_base),
-                tensor_shape=(tile_n, tile_k),
-                strides=(K, 1),
-                tile_shape=(tile_n, tile_k),
+                global_offset=(
+                    b_batch_off // arith.index(16) + blk_n // arith.index(16),
+                    k_base * arith.index(16)),
+                tensor_shape=(B * N // 16, K * 16),
+                strides=(K * 16, 1),
+                tile_shape=(tile_n // 16, tile_k * 16),
                 elem_bytes=1,
-                pad_interval=tile_k,
-                pad_amount=LDS_PAD_B_BYTES,
+                pad_interval=0,
+                pad_amount=0,
                 num_warps=tdm_desc_num_warps,
                 workgroup_mask=b_mcast_mask,
                 atomic_barrier_enable=atomic_barrier_enable,
@@ -318,11 +372,7 @@ def compile_bmm_w8a8_gfx1250(
 
         if const_expr(wave_specialized_tdm):
             tdm_wave_id = rocdl.wave_id()
-            tdm_wave_is_a = arith.cmpi(arith.CmpIPredicate.eq, tdm_wave_id, arith.constant(0, type=T.i32))
-
-            def _select_wave_tdm_value(a_value, b_value):
-                return arith.select(tdm_wave_is_a, a_value, b_value)
-
+            tdm_wave_is_a = (tdm_wave_id == fx.Int32(0)) | (tdm_wave_id == fx.Int32(2))
 
         def _precompute_a_lane_bases(lds_ptr):
             row_base = (warp_m_base + lane16) * arith.index(lds_a_stride_bytes)
@@ -334,12 +384,16 @@ def compile_bmm_w8a8_gfx1250(
             return lds_ptr, bases
         
         def _precompute_b_lane_bases(lds_ptr):
-            row_base = (warp_n_base + lane16) * arith.index(lds_b_stride_bytes)
-            k_half_off = lane_kgrp * arith.index(16)
+            _ngroup_stride = tile_k * 16
+            _n_group_base = arith.index(warp_tile_n // 16) * wave_n_idx
+            row_off = lane16 * arith.index(16)
+            k_tile_off = lane_kgrp * arith.index(256)
             bases = []
             for wn in range_constexpr(wmma_n_rep):
-                base = row_base + arith.index(wn * WMMA_N * lds_b_stride_bytes) + k_half_off
-                bases.append(base)
+                ngroup_off = _n_group_base * arith.index(
+                    _ngroup_stride
+                ) + arith.index(wn * _ngroup_stride)
+                bases.append(ngroup_off + row_off + k_tile_off)
             return lds_ptr, bases
 
         _div4 = arith.constant(2, type=T.i32)
@@ -385,6 +439,17 @@ def compile_bmm_w8a8_gfx1250(
                 fx.Vector(lds_load_b128_raw(lds_buffer, byte_off + arith.index(32))),
                 fx.Vector(lds_load_b128_raw(lds_buffer, byte_off + arith.index(64))),
                 fx.Vector(lds_load_b128_raw(lds_buffer, byte_off + arith.index(96))),
+            ]
+        
+        def _issue_frag_loads_bpreshuffle(lds_buffer, lane_base, ks):
+            _num_tiles = WMMA_K // 16
+            k_subtile_off = arith.index(ks * _num_tiles * 256)
+            byte_off = lane_base + k_subtile_off
+            return [
+                fx.Vector(lds_load_b128_raw(lds_buffer, byte_off)),
+                fx.Vector(lds_load_b128_raw(lds_buffer, byte_off + arith.index(512))),
+                fx.Vector(lds_load_b128_raw(lds_buffer, byte_off + arith.index(1024))),
+                fx.Vector(lds_load_b128_raw(lds_buffer, byte_off + arith.index(1536))),
             ]
 
         def _assemble_frag(raw4):
@@ -456,21 +521,23 @@ def compile_bmm_w8a8_gfx1250(
         stages_a_idx = [extract_lds_base_idx(stages_a[i]) for i in range_constexpr(num_buffers)]
         stages_b_idx = [extract_lds_base_idx(stages_b[i]) for i in range_constexpr(num_buffers)]
 
+        ###############################################################################
         a_scale_rows = None
 
-        scale_a_lds_off = 0x12000
-        scale_a_lds_bytes = tile_m * k_k_blocks  # 128 * 32 = 4096
-        assert scale_a_lds_off + scale_a_lds_bytes <= stage_b_data_off[0], (
-            "A-scale LDS staging overruns into the B region"
-        )
+        # assert scale_a_lds_off + scale_a_lds_bytes <= stage_b_data_off[0], (
+        #     "A-scale LDS staging overruns into the B region"
+        # )
         scale_a_lds = SmemPtr(arena_base_ptr, scale_a_lds_off, T.i8, shape=(scale_a_lds_bytes,))
         scale_a_lds_base_idx = extract_lds_base_idx(scale_a_lds)
 
+        # 4096 // (16 * 256) = 1
         _SC_DMA_BYTES = 16
         _sc_dma_ops = scale_a_lds_bytes // (block_threads * _SC_DMA_BYTES)
+
         assert _sc_dma_ops * block_threads * _SC_DMA_BYTES == scale_a_lds_bytes, (
             "A-scale tile not evenly divisible by the DMA batch"
         )
+        
         _sc_g_base = buffer_ops.extract_base_index(arg_a_scale, address_space=1)
         _sc_tile_byte = bz * m_idx * arith.index(k_k_blocks) + blk_m * arith.index(k_k_blocks)
         _sc_limit = arith.index(B) * m_idx * arith.index(k_k_blocks) - arith.index(_SC_DMA_BYTES)
@@ -533,7 +600,7 @@ def compile_bmm_w8a8_gfx1250(
                                   a_scales, b_scale, mid_compute_callback=None):
             current_accs = list(accs)
 
-            b_raw = [_issue_frag_loads(b_buf, b_bases[wn], 0) for wn in range_constexpr(wmma_n_rep)]
+            b_raw = [_issue_frag_loads_bpreshuffle(b_buf, b_bases[wn], 0) for wn in range_constexpr(wmma_n_rep)]
             b_frags = [_assemble_frag(r) for r in b_raw]
 
             a_raw = _issue_frag_loads(a_buf, a_bases[0], 0)
@@ -583,6 +650,7 @@ def compile_bmm_w8a8_gfx1250(
 
         desc_a_init = make_desc_a(stages_a_mem[0], arith.index(0))
         desc_b_init = make_desc_b(stages_b_mem[0], arith.index(0))
+
         addr_lo_a = _dg0_lane(desc_a_init, 2)
         addr_hi_a = _dg0_lane(desc_a_init, 3)
         addr_lo_b = _dg0_lane(desc_b_init, 2)
@@ -591,26 +659,48 @@ def compile_bmm_w8a8_gfx1250(
         dgroup1_b = desc_b_init.dgroup1
 
         adv_a_i32 = fx.Int32(tile_k)
-        adv_b_i32 = fx.Int32(tile_k)
+        adv_b_i32 = fx.Int32(tile_k * 16)
         pred_const = fx.Int32(1)
 
+        ############################
         def _pipeline_fence(outstanding=0):
             pipeline_fence(outstanding=outstanding, use_cluster=use_cluster)
 
         def _pipeline_fence_signal(outstanding=0):
             pipeline_fence_signal(outstanding=outstanding, use_cluster=use_cluster)
 
-        def _issue_ab(load_stage, addr_box, k_prefetch=None):
-            dg0_a = _pack_dg0(pred_const, stages_a_lds_addr[load_stage], addr_box[0][0], addr_hi_a)
-            dg0_b = _pack_dg0(pred_const, stages_b_lds_addr[load_stage], addr_box[1][0], addr_hi_b)
-            issue_tdm_loads(
-                tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
-                tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
-            )
-            addr_box[0][0] = addr_box[0][0] + adv_a_i32
-            addr_box[1][0] = addr_box[1][0] + adv_b_i32
-            if const_expr(k_prefetch is not None):
-                _l2_prefetch(k_prefetch)
+        if const_expr(wave_specialized_tdm):
+            # Wave 0/2 load A tiles; wave 1/3 load B tiles.
+            # All waves maintain both addr_lo_a and addr_lo_b as loop-carried SGPRs
+            # and advance both unconditionally, but each wave only issues its TDM.
+            def _issue_ab(load_stage, addr_box, k_prefetch=None):
+                dg0_a = _pack_dg0(pred_const, stages_a_lds_addr[load_stage], addr_box[0][0], addr_hi_a)
+                dg0_b = _pack_dg0(pred_const, stages_b_lds_addr[load_stage], addr_box[1][0], addr_hi_b)
+                desc_a = tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a)
+                desc_b = tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b)
+                if_a = scf.IfOp(_raw(tdm_wave_is_a), has_else=True)
+                with ir.InsertionPoint(if_a.then_block):
+                    tdm_ops.tensor_load_2d(desc_a)
+                    scf.YieldOp([])
+                with ir.InsertionPoint(if_a.else_block):
+                    tdm_ops.tensor_load_2d(desc_b)
+                    scf.YieldOp([])
+                addr_box[0][0] = addr_box[0][0] + adv_a_i32
+                addr_box[1][0] = addr_box[1][0] + adv_b_i32
+                if const_expr(k_prefetch is not None):
+                    _l2_prefetch(k_prefetch)
+        else:
+            def _issue_ab(load_stage, addr_box, k_prefetch=None):
+                dg0_a = _pack_dg0(pred_const, stages_a_lds_addr[load_stage], addr_box[0][0], addr_hi_a)
+                dg0_b = _pack_dg0(pred_const, stages_b_lds_addr[load_stage], addr_box[1][0], addr_hi_b)
+                issue_tdm_loads(
+                    tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
+                    tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
+                )
+                addr_box[0][0] = addr_box[0][0] + adv_a_i32
+                addr_box[1][0] = addr_box[1][0] + adv_b_i32
+                if const_expr(k_prefetch is not None):
+                    _l2_prefetch(k_prefetch)
 
         _prologue_box = [[addr_lo_a], [addr_lo_b]]
         for i in range_constexpr(pre_loaded):
@@ -845,5 +935,5 @@ def compile_bmm_w8a8_gfx1250(
     return launch_bmm_w8a8_gfx1250
 
 
-__all__ = ["compile_bmm_w8a8_gfx1250"]
+__all__ = ["compile_bmm_w8a8_preshuffle_gfx1250"]
 
