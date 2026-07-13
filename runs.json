@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-07-12T22:07:47Z",
+ "updated": "2026-07-13T02:33:09Z",
  "repo": "xiangM99/FlyDSL",
  "runs": [
   {
@@ -10,38 +10,38 @@
    "branch": "main",
    "event": "push",
    "title": "[rmsnorm] Add fused-add / residual backward (PR 2/3, #769) (#800)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "failure",
    "url": "https://github.com/xiangM99/FlyDSL/actions/runs/29179287268",
    "created_at": "2026-07-12T04:09:16Z",
-   "updated_at": "2026-07-12T04:09:55Z",
+   "updated_at": "2026-07-13T02:32:43Z",
    "actor": "xiangM99",
    "jobs": [
     {
      "runner": "linux-flydsl-navi-2",
      "arch": "gfx1201",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-12T04:09:55Z",
-     "completed_at": null,
+     "completed_at": "2026-07-13T02:32:42Z",
      "url": "https://github.com/xiangM99/FlyDSL/actions/runs/29179287268/job/86613995453"
     },
     {
      "runner": "linux-flydsl-mi355-1",
      "arch": "gfx950",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-12T04:09:55Z",
-     "completed_at": null,
+     "completed_at": "2026-07-13T02:32:42Z",
      "url": "https://github.com/xiangM99/FlyDSL/actions/runs/29179287268/job/86613995454"
     },
     {
      "runner": "linux-flydsl-mi325-1",
      "arch": "gfx942",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-12T04:09:55Z",
-     "completed_at": null,
+     "completed_at": "2026-07-13T02:32:42Z",
      "url": "https://github.com/xiangM99/FlyDSL/actions/runs/29179287268/job/86613995481"
     }
    ]
