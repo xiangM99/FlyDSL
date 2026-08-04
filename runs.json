@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-08-04T03:37:03Z",
+ "updated": "2026-08-04T09:08:07Z",
  "repo": "xiangM99/FlyDSL",
  "runs": [
+  {
+   "run_id": 30889864670,
+   "pr": null,
+   "commit": "c212733e43f182007910a5d00cbfc3a5fdeab2c0",
+   "branch": "main",
+   "event": "push",
+   "title": "Feat: Add flydsl-lsp-server for FlyDSL .mlir editor support. (#952)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/xiangM99/FlyDSL/actions/runs/30889864670",
+   "created_at": "2026-08-04T07:56:50Z",
+   "updated_at": "2026-08-04T07:57:33Z",
+   "actor": "xiangM99",
+   "jobs": []
+  },
   {
    "run_id": 29817751347,
    "pr": null,
